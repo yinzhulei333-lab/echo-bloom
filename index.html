@@ -1,0 +1,499 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>ECHO BLOOM — an interactive garden for your voice and motion</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  html, body { height: 100%; overflow: hidden; background: #05060f; }
+  body {
+    font-family: Georgia, "Songti SC", serif;
+    color: #cfd6ff;
+    cursor: crosshair;
+  }
+  canvas { position: fixed; inset: 0; width: 100vw; height: 100vh; display: block; }
+
+  .title {
+    position: fixed; top: 4vh; left: 50%; transform: translateX(-50%);
+    text-align: center; pointer-events: none; z-index: 2;
+    transition: opacity 2s;
+  }
+  .title h1 {
+    font-size: clamp(28px, 4.5vw, 54px);
+    font-weight: normal;
+    letter-spacing: 0.45em;
+    text-indent: 0.45em;
+    color: #eef1ff;
+    text-shadow: 0 0 24px rgba(140, 160, 255, .55);
+  }
+  .title p {
+    margin-top: 14px;
+    font-size: clamp(12px, 1.3vw, 15px);
+    font-style: italic;
+    color: #8b93c9;
+    letter-spacing: .12em;
+  }
+  .title.fade { opacity: 0; }
+
+  .controls {
+    position: fixed; top: 18px; right: 18px; z-index: 3;
+    display: flex; gap: 10px;
+  }
+  .controls button {
+    background: rgba(255,255,255,.04);
+    color: #aeb6e8;
+    border: 1px solid rgba(160,170,230,.35);
+    border-radius: 999px;
+    padding: 9px 18px;
+    font-family: inherit;
+    font-size: 13px;
+    letter-spacing: .08em;
+    cursor: pointer;
+    backdrop-filter: blur(6px);
+    transition: all .25s;
+  }
+  .controls button:hover { border-color: #aeb6e8; color: #fff; }
+  .controls button.on {
+    background: rgba(120,140,255,.18);
+    border-color: #8fa2ff;
+    color: #fff;
+    box-shadow: 0 0 18px rgba(130,150,255,.35);
+  }
+
+  .status {
+    position: fixed; bottom: 18px; left: 22px; z-index: 2;
+    font-size: 12.5px; font-style: italic; color: #6d75a8;
+    letter-spacing: .05em; line-height: 1.8;
+    max-width: 46ch;
+    pointer-events: none;
+  }
+  .status .line { transition: opacity .5s; }
+
+  .levelbar {
+    position: fixed; bottom: 18px; right: 22px; z-index: 2;
+    width: 140px; height: 4px;
+    background: rgba(255,255,255,.08);
+    border-radius: 2px; overflow: hidden;
+    opacity: 0; transition: opacity .4s;
+  }
+  .levelbar.show { opacity: 1; }
+  .levelbar > div { height: 100%; width: 0%; background: linear-gradient(90deg, #6ea8ff, #c98bff, #ff8bd0); }
+
+  .toast {
+    position: fixed; top: 76px; left: 50%; transform: translateX(-50%) translateY(-8px);
+    background: rgba(20, 22, 45, .92);
+    border: 1px solid rgba(160,170,230,.4);
+    color: #e6e9ff;
+    padding: 11px 22px; border-radius: 10px;
+    font-size: 13.5px; font-style: italic; letter-spacing: .04em;
+    opacity: 0; pointer-events: none; transition: opacity .25s, transform .25s;
+    z-index: 9; max-width: 80vw; text-align: center;
+  }
+  .toast.show { opacity: 1; transform: translateX(-50%) translateY(0); }
+
+  .hint-cred {
+    position: fixed; bottom: 18px; left: 50%; transform: translateX(-50%);
+    font-size: 11px; color: #454c78; letter-spacing: .1em; z-index: 2; pointer-events: none;
+  }
+</style>
+</head>
+<body>
+
+<canvas id="c"></canvas>
+
+<div class="title" id="title">
+  <h1>E C H O &nbsp; B L O O M</h1>
+  <p>move to stir the wind · shout and it blooms · grab the air, then let go</p>
+</div>
+
+<div class="controls">
+  <button id="micBtn">🎙 enable voice</button>
+  <button id="camBtn">📷 enable camera</button>
+</div>
+
+<div class="status"><div class="line" id="statusLine">…</div></div>
+<div class="levelbar" id="levelBar"><div></div></div>
+<div class="toast" id="toast"></div>
+<div class="hint-cred">no data leaves your device — everything is computed locally</div>
+
+<video id="video" playsinline muted style="display:none"></video>
+
+<script>
+(() => {
+  "use strict";
+
+  /* ============================================================
+     ECHO BLOOM — an interactive generative garden.
+     voice  → blooms burst in your volume & tone-colour
+     motion → glowing trails stir the wind; hold still then
+              pull away ("grab & release") → a big bloom
+     mouse  → always available as a fallback instrument
+     ============================================================ */
+
+  const canvas = document.getElementById("c");
+  const ctx = canvas.getContext("2d");
+  const title = document.getElementById("title");
+  const statusLine = document.getElementById("statusLine");
+  const toastEl = document.getElementById("toast");
+  const micBtn = document.getElementById("micBtn");
+  const camBtn = document.getElementById("camBtn");
+  const levelBar = document.getElementById("levelBar");
+  const levelFill = levelBar.firstElementChild;
+  const video = document.getElementById("video");
+
+  let W, H;
+  function resize() {
+    W = canvas.width = innerWidth;
+    H = canvas.height = innerHeight;
+  }
+  resize();
+  addEventListener("resize", resize);
+
+  /* ============ state ============ */
+  let particles = [];        // everything drawn
+  let frame = 0;
+  let hueBase = 220;         // slowly drifting global hue
+  let micOn = false, camOn = false;
+  let micStream = null, camStream = null;
+  let audioCtx = null, analyser = null, timeData = null, freqData = null;
+  let diffCanvas = null, diffCtx = null, prevFrame = null;
+  const MOTION_W = 80, MOTION_H = 60;
+  let motionEnergy = [];     // recent per-frame motion energy history
+  let motionCentroid = { x: W / 2, y: H / 2 };
+  let grabArmed = false, grabEnergySum = 0, grabFrames = 0;
+  let lastVoiceBloom = 0;
+  let lastInteraction = Date.now();
+  let toastTimer = null;
+
+  /* ============ helpers ============ */
+  function toast(msg, ms = 3200) {
+    toastEl.textContent = msg;
+    toastEl.classList.add("show");
+    clearTimeout(toastTimer);
+    toastTimer = setTimeout(() => toastEl.classList.remove("show"), ms);
+  }
+  function setStatus(html) { statusLine.innerHTML = html; }
+  function rand(a, b) { return a + Math.random() * (b - a); }
+
+  /* ============ particle kinds ============ */
+  // dust: ambient floating specks
+  // trail: painted by camera motion / mouse movement
+  // petal: burst fragments of a bloom
+  // ring: expanding halo of a bloom
+  function spawnBloom(x, y, energy, hue) {
+    const n = Math.floor(14 + energy * 30);
+    for (let i = 0; i < n; i++) {
+      const a = Math.random() * Math.PI * 2;
+      const sp = rand(0.4, 1.4) * (1.5 + energy * 3);
+      particles.push({
+        kind: "petal", x, y,
+        vx: Math.cos(a) * sp, vy: Math.sin(a) * sp - rand(0, .6),
+        life: 1, decay: rand(.004, .011),
+        hue: hue + rand(-24, 24), size: rand(1.4, 3.4),
+        spin: rand(-.05, .05), rot: Math.random() * Math.PI
+      });
+    }
+    particles.push({ kind: "ring", x, y, r: 4, life: 1, hue, grow: 2.2 + energy * 4 });
+    lastInteraction = Date.now();
+  }
+
+  function spawnTrail(x, y, hue, strength) {
+    particles.push({
+      kind: "trail", x, y,
+      vx: rand(-.3, .3), vy: rand(-.5, -.1),
+      life: 1, decay: rand(.006, .014),
+      hue: hue + rand(-16, 16), size: rand(1, 2.6) * (0.6 + strength)
+    });
+  }
+
+  function initDust() {
+    for (let i = 0; i < 70; i++) {
+      particles.push({
+        kind: "dust", x: rand(0, W), y: rand(0, H),
+        vx: rand(-.15, .15), vy: rand(-.25, -.05),
+        life: rand(.4, 1), decay: .001, hue: hueBase + rand(-30, 30), size: rand(.6, 1.8)
+      });
+    }
+  }
+
+  /* ============ voice input ============ */
+  micBtn.addEventListener("click", async () => {
+    if (!window.isSecureContext || !navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+      toast("This page is running in a restricted frame — open it directly in a browser tab (https or localhost) to unlock voice 🎙", 5000);
+      return;
+    }
+    ensureAudioCtx();
+    if (micOn) { stopMic(); return; }
+    try {
+      micStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      const src = audioCtx.createMediaStreamSource(micStream);
+      analyser = audioCtx.createAnalyser();
+      analyser.fftSize = 1024;
+      src.connect(analyser);
+      timeData = new Uint8Array(analyser.fftSize);
+      freqData = new Uint8Array(analyser.frequencyBinCount);
+      micOn = true;
+      micBtn.classList.add("on");
+      micBtn.textContent = "🎙 voice on";
+      toast("Voice connected — shout, whisper, sing 🎶");
+      updateStatus();
+    } catch (err) {
+      micOn = false;
+      micBtn.classList.remove("on");
+      if (err.name === "NotAllowedError") toast("Microphone permission was denied — no problem, your hands and mouse still shape the garden 🌸", 4500);
+      else toast("No microphone available — the garden still answers your hands 🌸", 4500);
+    }
+  });
+
+  function stopMic() {
+    if (micStream) micStream.getTracks().forEach(t => t.stop());
+    micStream = null; analyser = null; micOn = false;
+    micBtn.classList.remove("on");
+    micBtn.textContent = "🎙 enable voice";
+    levelBar.classList.remove("show");
+    updateStatus();
+  }
+
+  function ensureAudioCtx() {
+    if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+    if (audioCtx.state === "suspended") audioCtx.resume();
+  }
+
+  function voiceTick() {
+    if (!micOn || !analyser) return;
+    analyser.getByteTimeDomainData(timeData);
+    analyser.getByteFrequencyData(freqData);
+    // RMS volume
+    let sum = 0;
+    for (let i = 0; i < timeData.length; i++) {
+      const v = (timeData[i] - 128) / 128;
+      sum += v * v;
+    }
+    const rms = Math.sqrt(sum / timeData.length);
+    levelFill.style.width = Math.min(100, rms * 260) + "%";
+
+    if (rms > 0.09) {
+      const now = performance.now();
+      if (now - lastVoiceBloom > 240) {
+        lastVoiceBloom = now;
+        // spectral centroid → hue
+        let wsum = 0, total = 0;
+        for (let i = 0; i < freqData.length; i++) { wsum += freqData[i] * i; total += freqData[i]; }
+        const centroid = total > 0 ? wsum / total / freqData.length : 0.3;
+        const hue = 180 + centroid * 160;
+        const energy = Math.min(1, (rms - 0.09) * 4);
+        spawnBloom(rand(W * .25, W * .75), rand(H * .3, H * .65), energy, hue);
+      }
+    }
+  }
+
+  /* ============ camera motion input ============ */
+  camBtn.addEventListener("click", async () => {
+    if (!window.isSecureContext || !navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+      toast("This page is running in a restricted frame — open it directly in a browser tab (https or localhost) to unlock the camera 📷", 5000);
+      return;
+    }
+    if (camOn) { stopCam(); return; }
+    try {
+      camStream = await navigator.mediaDevices.getUserMedia({
+        video: { width: { ideal: 320 }, height: { ideal: 240 } }
+      });
+      video.srcObject = camStream;
+      await video.play();
+      diffCanvas = document.createElement("canvas");
+      diffCanvas.width = MOTION_W; diffCanvas.height = MOTION_H;
+      diffCtx = diffCanvas.getContext("2d", { willReadFrequently: true });
+      prevFrame = null;
+      camOn = true;
+      camBtn.classList.add("on");
+      camBtn.textContent = "📷 camera on";
+      toast("Camera connected — you are the wind now. Move, then hold still and pull away 🌬", 4500);
+      updateStatus();
+    } catch (err) {
+      camOn = false;
+      camBtn.classList.remove("on");
+      if (err.name === "NotAllowedError") toast("Camera permission was denied — the garden still listens to your voice and mouse 🌸", 4500);
+      else toast("No camera available — voice and mouse still work 🌸", 4500);
+    }
+  });
+
+  function stopCam() {
+    if (camStream) camStream.getTracks().forEach(t => t.stop());
+    camStream = null; camOn = false; prevFrame = null;
+    camBtn.classList.remove("on");
+    camBtn.textContent = "📷 enable camera";
+    updateStatus();
+  }
+
+  function camTick() {
+    if (!camOn || video.readyState < 2) return;
+    diffCtx.drawImage(video, 0, 0, MOTION_W, MOTION_H);
+    const data = diffCtx.getImageData(0, 0, MOTION_W, MOTION_H).data;
+    if (prevFrame) {
+      let energy = 0, sx = 0, sy = 0, cells = 0;
+      const step = 4;
+      for (let y = 0; y < MOTION_H; y += step) {
+        for (let x = 0; x < MOTION_W; x += step) {
+          const i = (y * MOTION_W + x) * 4;
+          const d = Math.abs(data[i] - prevFrame[i]) + Math.abs(data[i+1] - prevFrame[i+1]) + Math.abs(data[i+2] - prevFrame[i+2]);
+          if (d > 48) {
+            energy += d;
+            cells++;
+            sx += x; sy += y;
+            // paint a trail where motion happens (mirror x so it feels like a mirror)
+            const px = W - (x / MOTION_W) * W;
+            const py = (y / MOTION_H) * H;
+            if (frame % 2 === 0) spawnTrail(px, py, hueBase + rand(-20, 40), Math.min(2, d / 120));
+          }
+        }
+      }
+      if (cells > 0) motionCentroid = { x: W - (sx / cells / MOTION_W) * W, y: (sy / cells / MOTION_H) * H };
+      const norm = energy / 60;   // rough normalisation
+      motionEnergy.push(norm);
+      if (motionEnergy.length > 14) motionEnergy.shift();
+
+      // grab & release: sustained motion, then a sudden stop
+      if (motionEnergy.length === 14) {
+        const recent = motionEnergy.slice(0, 12).reduce((a, b) => a + b, 0) / 12;
+        const current = motionEnergy[13];
+        if (recent > 3.5) grabArmed = true;
+        if (grabArmed) { grabEnergySum += recent; grabFrames++; }
+        if (grabArmed && current < recent * 0.35) {
+          // RELEASE!
+          const hue = hueBase + rand(60, 160);
+          spawnBloom(motionCentroid.x, motionCentroid.y, Math.min(1, 0.5 + grabEnergySum / (grabFrames * 8 + 1)), hue);
+          grabArmed = false; grabEnergySum = 0; grabFrames = 0;
+          motionEnergy = [];
+        }
+      }
+      lastInteraction = Date.now();
+    }
+    prevFrame = data.slice ? data.slice() : new Uint8ClampedArray(data);
+  }
+
+  /* ============ mouse / touch fallback ============ */
+  let lastMouse = { x: W/2, y: H/2 }, mouseMoveT = 0;
+  addEventListener("pointermove", e => {
+    const dx = e.clientX - lastMouse.x, dy = e.clientY - lastMouse.y;
+    const sp = Math.hypot(dx, dy);
+    if (sp > 4 && frame % 2 === 0) {
+      spawnTrail(e.clientX, e.clientY, hueBase + rand(-30, 50), Math.min(2, sp / 40));
+    }
+    lastMouse = { x: e.clientX, y: e.clientY };
+    lastInteraction = Date.now();
+  });
+  addEventListener("pointerdown", e => {
+    if (e.target.closest("button")) return;
+    spawnBloom(e.clientX, e.clientY, rand(.4, .9), hueBase + rand(-40, 80));
+    lastInteraction = Date.now();
+  });
+
+  /* ============ idle breathing ============ */
+  function idleTick() {
+    if (Date.now() - lastInteraction > 9000 && Math.random() < 0.012) {
+      spawnBloom(rand(W * .2, W * .8), rand(H * .25, H * .7), rand(.2, .5), hueBase + rand(-40, 90));
+    }
+  }
+
+  /* ============ render ============ */
+  function render() {
+    // fading veil → trails linger like ink
+    ctx.globalCompositeOperation = "source-over";
+    ctx.fillStyle = "rgba(5, 6, 15, 0.13)";
+    ctx.fillRect(0, 0, W, H);
+
+    ctx.globalCompositeOperation = "lighter";
+
+    for (const p of particles) {
+      if (p.kind === "petal") {
+        p.x += p.vx; p.y += p.vy;
+        p.vy += 0.012;                 // gentle gravity
+        p.vx *= 0.985; p.vy *= 0.985;
+        p.rot += p.spin;
+        p.life -= p.decay;
+        ctx.save();
+        ctx.translate(p.x, p.y);
+        ctx.rotate(p.rot);
+        ctx.globalAlpha = Math.max(0, p.life) * .9;
+        ctx.fillStyle = `hsl(${p.hue}, 90%, 68%)`;
+        ctx.shadowColor = `hsl(${p.hue}, 90%, 70%)`;
+        ctx.shadowBlur = 8;
+        ctx.beginPath();
+        ctx.ellipse(0, 0, p.size * 2.2, p.size, 0, 0, Math.PI * 2);
+        ctx.fill();
+        ctx.restore();
+      } else if (p.kind === "ring") {
+        p.r += p.grow;
+        p.grow *= 0.97;
+        p.life -= 0.02;
+        ctx.globalAlpha = Math.max(0, p.life) * .7;
+        ctx.strokeStyle = `hsl(${p.hue}, 85%, 72%)`;
+        ctx.lineWidth = 2;
+        ctx.shadowColor = `hsl(${p.hue}, 85%, 72%)`;
+        ctx.shadowBlur = 12;
+        ctx.beginPath();
+        ctx.arc(p.x, p.y, p.r, 0, Math.PI * 2);
+        ctx.stroke();
+      } else if (p.kind === "trail") {
+        p.x += p.vx; p.y += p.vy;
+        p.life -= p.decay;
+        ctx.globalAlpha = Math.max(0, p.life) * .8;
+        ctx.fillStyle = `hsl(${p.hue}, 85%, 72%)`;
+        ctx.shadowColor = `hsl(${p.hue}, 85%, 72%)`;
+        ctx.shadowBlur = 7;
+        ctx.beginPath();
+        ctx.arc(p.x, p.y, p.size, 0, Math.PI * 2);
+        ctx.fill();
+      } else if (p.kind === "dust") {
+        p.x += p.vx + Math.sin((frame + p.y) * 0.01) * 0.1;
+        p.y += p.vy;
+        if (p.y < -10) { p.y = H + 10; p.x = rand(0, W); }
+        ctx.globalAlpha = 0.25 * p.life;
+        ctx.fillStyle = `hsl(${p.hue}, 60%, 80%)`;
+        ctx.beginPath();
+        ctx.arc(p.x, p.y, p.size, 0, Math.PI * 2);
+        ctx.fill();
+      }
+    }
+    ctx.globalAlpha = 1;
+    ctx.shadowBlur = 0;
+
+    particles = particles.filter(p => p.life > 0);
+    if (particles.length > 1400) particles.splice(0, particles.length - 1400);
+
+    // global hue drifts like daylight
+    if (frame % 30 === 0) hueBase = (hueBase + 0.8) % 360;
+  }
+
+  /* ============ status text ============ */
+  function updateStatus() {
+    const lines = [];
+    if (camOn) lines.push("camera · your motion paints the wind");
+    if (micOn) lines.push("voice · loud sounds bloom in your tone-colour");
+    if (!camOn && !micOn) lines.push("moving your mouse stirs the wind · clicking blooms flowers");
+    lines.push(camOn ? "hold still, then pull away — let go of the air" : "enable the camera for the full grab-and-release gesture");
+    setStatus(lines.join("<br>"));
+  }
+
+  /* ============ loop ============ */
+  function loop() {
+    frame++;
+    camTick();
+    voiceTick();
+    idleTick();
+    render();
+    // fade the intro title once the visitor starts interacting
+    if (frame === 480 || (frame > 240 && Date.now() - lastInteraction < 3000 && particles.length > 300)) {
+      title.classList.add("fade");
+    }
+    requestAnimationFrame(loop);
+  }
+
+  initDust();
+  updateStatus();
+  loop();
+})();
+</script>
+</body>
+</html>
