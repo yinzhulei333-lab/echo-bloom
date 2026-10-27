@@ -1,5 +1,7 @@
 # ECHO BLOOM 🌬🌸
 
+**▶ Play it live: https://yinzhulei333-lab.github.io/echo-bloom/** (https — camera and microphone work here)
+
 An interactive generative-art garden that responds to your **voice**, your **motion**, and your **hands** — built with vanilla HTML/CSS/JS and the Canvas API. No libraries, no accounts, no data leaves the device.
 
 ## The idea
